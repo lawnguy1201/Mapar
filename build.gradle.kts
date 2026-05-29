@@ -34,23 +34,23 @@ dependencies {
     minecraft(libs.minecraft)
     mappings(variantOf(libs.yarn) { classifier("v2") })
     modImplementation(libs.fabric.loader)
-
-    // Fabric API — FIX: you were missing this entirely
-    // without it net.fabricmc.* imports won't resolve
     modImplementation(libs.fabric.api)
 
-    // Litematica + MaLiLib modCompileOnly
+    // Litematica + MaLiLib
     modImplementation(files("libs/litematica-fabric-1.21.4-0.21.4-sakura.4.jar"))
     modImplementation(files("libs/malilib-fabric-1.21.4-0.23.3-sakura.6.jar"))
 
-
     // Printer
     modImplementation(files("libs/litematica-printer-1_21.4-3.3.16.jar"))
-    modImplementation("dev.babbaj:nether-pathfinder:1.6")
-    // Meteor + Baritone
-    modImplementation(libs.meteor.client)
+
+    // Baritone — user must install separately
     modImplementation("meteordevelopment:baritone:1.21.4-SNAPSHOT")
 
+
+    modImplementation("dev.babbaj:nether-pathfinder:1.6")
+    include("dev.babbaj:nether-pathfinder:1.6")
+
+    modImplementation(libs.meteor.client)
 }
 
 java {

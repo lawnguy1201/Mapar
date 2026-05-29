@@ -19,4 +19,4 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "addon-template"
+rootProject.name = "Alpha-Mapar-Client"
