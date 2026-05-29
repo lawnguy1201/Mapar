@@ -9,10 +9,20 @@ base {
 }
 
 repositories {
+    flatDir {
+        dirs("libs")
+    }
+
     maven {
         name = "meteor-maven"
         url = uri("https://maven.meteordev.org/releases")
     }
+
+    maven {
+        name = "babbaj"
+        url = uri("https://babbaj.github.io/maven/")
+    }
+
     maven {
         name = "meteor-maven-snapshots"
         url = uri("https://maven.meteordev.org/snapshots")
@@ -25,19 +35,37 @@ dependencies {
     mappings(variantOf(libs.yarn) { classifier("v2") })
     modImplementation(libs.fabric.loader)
 
-    // Meteor
+    // Fabric API — FIX: you were missing this entirely
+    // without it net.fabricmc.* imports won't resolve
+    modImplementation(libs.fabric.api)
+
+    // Litematica + MaLiLib modCompileOnly
+    modImplementation(files("libs/litematica-fabric-1.21.4-0.21.4-sakura.4.jar"))
+    modImplementation(files("libs/malilib-fabric-1.21.4-0.23.3-sakura.6.jar"))
+
+
+    // Printer
+    modImplementation(files("libs/litematica-printer-1_21.4-3.3.16.jar"))
+    modImplementation("dev.babbaj:nether-pathfinder:1.6")
+    // Meteor + Baritone
     modImplementation(libs.meteor.client)
+    modImplementation("meteordevelopment:baritone:1.21.4-SNAPSHOT")
+
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 tasks {
     processResources {
         val propertyMap = mapOf(
             "version" to project.version,
-            "mc_version" to libs.versions.minecraft.get()
+            "mc_version" to libs.versions.minecraftVersion.get()
         )
 
         inputs.properties(propertyMap)
-
         filteringCharset = "UTF-8"
 
         filesMatching("fabric.mod.json") {
@@ -51,11 +79,6 @@ tasks {
         from("LICENSE") {
             rename { "${it}_${inputs.properties["archivesName"]}" }
         }
-    }
-
-    java {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
     }
 
     withType<JavaCompile> {

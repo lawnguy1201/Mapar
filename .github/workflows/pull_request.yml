@@ -1,4 +1,4 @@
-name: Build Pull Request Artifacts
+name: build Pull Request Artifacts
 on: pull_request
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
           distribution: 'temurin'
           java-version: 21
 
-      - name: Build with Gradle
+      - name: build with Gradle
         run: ./gradlew build
 
       - name: Release

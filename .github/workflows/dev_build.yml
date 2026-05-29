@@ -1,4 +1,4 @@
-name: Publish Development Build
+name: Publish Development build
 on: push
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
           distribution: 'temurin'
           java-version: 21
 
-      - name: Build with Gradle
+      - name: build with Gradle
         run: ./gradlew build
 
       - name: Release
@@ -28,7 +28,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: snapshot
-          name: Dev Build
+          name: Dev build
           prerelease: true
           files: |
             ./build/libs/*.jar

@@ -9,4 +9,14 @@ pluginManagement {
     }
 }
 
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven("https://maven.fabricmc.net/")
+        maven("https://maven.meteordev.org/releases")
+        maven("https://maven.meteordev.org/snapshots")
+        maven("https://babbaj.github.io/maven/")
+    }
+}
+
 rootProject.name = "addon-template"

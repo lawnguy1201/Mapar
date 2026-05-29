@@ -1,0 +1,10 @@
+ALL COORDS FOR AUTOMAPBOT TESTING
+
+Schem: -16, -62, 12
+Cart: 26, -58, 10
+MapChest: 25, -59, 10
+Output: 27, -59, 10
+Rest: 9, -59, 11
+SMin: 7, -60, 12
+SMax: 23, -56, 7
+

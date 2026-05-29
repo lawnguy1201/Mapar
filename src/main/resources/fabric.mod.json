@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "addon-template",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "Mapar",
+  "description": "An Meteor Addon for Mapar Util",
   "authors": [
-    "seasnail"
+    "Lawnguy"
   ],
   "contact": {
     "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
@@ -14,7 +14,7 @@
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "com.example.addon.Addon"
     ]
   },
   "mixins": [
@@ -29,8 +29,14 @@
     }
   },
   "depends": {
-    "java": ">=21",
-    "minecraft": ["${mc_version}"],
-    "meteor-client": "*"
+    "fabricloader": ">=0.15.11",
+    "fabric": "*",
+    "minecraft": "1.21.4",
+    "malilib": "*",
+    "litematica": "*",
+    "litematica_printer": "*",
+    "java": ">=21"
   }
 }
+
+
