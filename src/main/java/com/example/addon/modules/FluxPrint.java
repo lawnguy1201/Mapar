@@ -59,6 +59,7 @@ import utils.Timer;
 // java
 import java.io.File;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 
 
 public class FluxPrint extends Module
@@ -85,6 +86,24 @@ public class FluxPrint extends Module
         .defaultValue(0)
         .min(0)
         .sliderRange(0, 5000)
+        .build()
+    );
+
+    private final Setting<PlacementAlgo> placementAlgo = sgGeneral.add(new EnumSetting.Builder<PlacementAlgo>()
+        .name("placement algorithm")
+        .description("Order in which placeable clusters are visited. "
+            + "FURTHEST_FIRST = back-of-platform first then nearest (default), "
+            + "NEAREST_FIRST = always closest cluster, "
+            + "SCANLINE = row-major sweep, "
+            + "SPIRAL = from schematic center outward.")
+        .defaultValue(PlacementAlgo.FURTHEST_FIRST)
+        .build()
+    );
+
+    private final Setting<Boolean> fixErrors = sgGeneral.add(new BoolSetting.Builder()
+        .name("fix placement errors")
+        .description("When the printer leaves a WRONG block (not just a missing one), walk to it and break it so the printer can re-place correctly. Prevents the bot circling a mis-placed block forever.")
+        .defaultValue(true)
         .build()
     );
 
@@ -124,6 +143,24 @@ public class FluxPrint extends Module
         .defaultValue(0.65)
         .min(0)
         .sliderRange(0, 5)
+        .build()
+    );
+
+    private final Setting<Double> chestRefillWait = sgTiming.add(new DoubleSetting.Builder()
+        .name("chest refill wait")
+        .description("Restock chests are hopper-fed into slot 0. After taking slot 0, wait this many seconds for the hopper to refill it before declaring the chest drained and moving to the next chest.")
+        .defaultValue(3.0)
+        .min(0)
+        .sliderRange(0, 30)
+        .build()
+    );
+
+    private final Setting<Double> errorBreakTimeout = sgTiming.add(new DoubleSetting.Builder()
+        .name("error break timeout")
+        .description("Maximum seconds to spend breaking a single wrong block before giving up on it (so a stubborn block doesn't create a new infinite loop).")
+        .defaultValue(8.0)
+        .min(1)
+        .sliderRange(1, 60)
         .build()
     );
 
@@ -248,6 +285,7 @@ public class FluxPrint extends Module
         DROPPING_EXCESS,
         RESTOCKING,
         PLACING,
+        CLEARING_ERRORS,
         VERIFYING,
         CAPTURE_MAP,
         LOCK_MAP,
@@ -255,6 +293,17 @@ public class FluxPrint extends Module
         MOVE_TO_OUTPUT,
         PAUSED,
         FINISHED
+    }
+
+    /***
+     * PlacementAlgo selects the order in which placeable clusters are visited during PLACING.
+     */
+    public enum PlacementAlgo
+    {
+        FURTHEST_FIRST,
+        NEAREST_FIRST,
+        SCANLINE,
+        SPIRAL
     }
 
     private BotState state = BotState.IDLE;
@@ -270,6 +319,8 @@ public class FluxPrint extends Module
     private final Map<Item, Integer>         matNeeded    = new HashMap<>();
     private List<BlockPos>                   unplacedCache = new ArrayList<>();
 
+    private Map<Item, Integer>               remainingMatsCache = new HashMap<>();
+
     private final Timer itemGrabTimer        = new Timer();
     private final Timer resetWaitTimer       = new Timer();
     private final Timer baritoneArrivalTimer = new Timer();
@@ -280,6 +331,8 @@ public class FluxPrint extends Module
     private final Timer baritoneStartTimer   = new Timer();
     private final Timer clearAreaTimer       = new Timer();
     private final Timer clusterStuckTimer    = new Timer();
+    private final Timer refillWaitTimer      = new Timer();
+    private final Timer errorBreakTimer      = new Timer();
     private       int   nudgeDirIdx          = 0;
 
     private boolean walkingToStation          = false;
@@ -298,8 +351,13 @@ public class FluxPrint extends Module
     private boolean clusterNearestToPlayer    = false;
     private boolean clearAreaStarted          = false;
     private boolean walkingToDropPos          = false;
+    private boolean walkingToError            = false;
+    private boolean awaitingChestRefill       = false;
 
     private boolean baritoneArrived = false;
+
+    private BlockPos        currentErrorTarget = null;
+    private final Set<BlockPos> unbreakableErrors = new HashSet<>();
 
     private static final int  SCHEMATIC_SIZE    = 128;
     private static final int  SCHEMATIC_CENTER  = SCHEMATIC_SIZE / 2;
@@ -313,9 +371,16 @@ public class FluxPrint extends Module
     private BlockPos currentClusterTarget = null;
 
 
+    private volatile CompletableFuture<Integer> conversionFuture;
+
+
     /***
      * convertSchematics() converts all .nbt structure files to .litematic format.
-     * made by my good friend Claudeus
+     *
+     * The actual NBT parsing / file I/O runs on a background thread via CompletableFuture so 35+
+     * files don't freeze the game on startup. This method is called from onTick: the first call
+     * spawns the future, subsequent calls just poll until it resolves, then advance bot state.
+     *
      */
     private void convertSchematics()
     {
@@ -332,214 +397,245 @@ public class FluxPrint extends Module
             }
         }
 
-        File[] nbtFiles = schematicsFolder.listFiles((dir, name) -> name.endsWith(".nbt"));
-
-        if (nbtFiles == null || nbtFiles.length == 0)
+        if (conversionFuture == null)
         {
-            LogUtils.log("No .nbt files found — skipping conversion.");
-            state = BotState.INITIALIZING;
+            File[] nbtFiles = schematicsFolder.listFiles((dir, name) -> name.endsWith(".nbt"));
+
+            if (nbtFiles == null || nbtFiles.length == 0)
+            {
+                LogUtils.log("No .nbt files found skipping conversion.");
+                state = BotState.INITIALIZING;
+                return;
+            }
+
+            // build the work list: only files that don't already have a matching .litematic
+            List<File> toConvert = new ArrayList<>();
+            for (File nbtFile : nbtFiles)
+            {
+                File litFile = new File(schematicsFolder, nbtFile.getName().replace(".nbt", ".litematic"));
+                if (!litFile.exists()) toConvert.add(nbtFile);
+            }
+
+            if (toConvert.isEmpty())
+            {
+                LogUtils.log("All " + nbtFiles.length + " .nbt files already converted - skipping conversion.");
+                state = BotState.INITIALIZING;
+                return;
+            }
+
+            LogUtils.log("Converting " + toConvert.size() + " .nbt files to .litematic in the background...");
+            state = BotState.CONVERTING;
+
+            File outFolder = schematicsFolder;
+
+            conversionFuture = CompletableFuture.supplyAsync(() ->
+            {
+                int converted = 0;
+                int failed    = 0;
+                for (File f : toConvert)
+                {
+                    try
+                    {
+                        convertOneFile(f, outFolder);
+                        converted++;
+                    }
+                    catch (Exception e)
+                    {
+                        LogUtils.error("Error converting " + f.getName() + ": " + e.getMessage());
+                        e.printStackTrace();
+                        failed++;
+                    }
+                }
+                LogUtils.log("Conversion done - " + converted + " converted, " + failed + " failed.");
+                return failed;
+            });
             return;
         }
 
-        boolean allConverted = true;
-        for (File nbtFile : nbtFiles)
-        {
-            File litFile = new File(schematicsFolder, nbtFile.getName().replace(".nbt", ".litematic"));
-            if (!litFile.exists())
-            {
-                allConverted = false;
-                break;
-            }
-        }
+        // === subsequent calls: poll until the background work finishes ===
+        if (!conversionFuture.isDone()) return;
 
-        if (allConverted)
+        int failed;
+        try
         {
-            LogUtils.log("All .nbt files already converted — skipping conversion.");
-            state = BotState.INITIALIZING;
+            failed = conversionFuture.get();
+        }
+        catch (Exception e)
+        {
+            LogUtils.error("Conversion future failed: " + e.getMessage());
+            conversionFuture = null;
+            pause("Conversion Threw Exception");
             return;
         }
-
-        LogUtils.log("Converting " + nbtFiles.length + " .nbt files to .litematic...");
-
-        int converted = 0;
-        int failed    = 0;
-
-        for (File nbtFile : nbtFiles)
+        finally
         {
-            String newName = nbtFile.getName().replace(".nbt", ".litematic");
-            File   outFile = new File(schematicsFolder, newName);
-
-            if (outFile.exists())
-            {
-                LogUtils.log("Already converted: " + newName + "  skipping.");
-                converted++;
-                continue;
-            }
-
-            try
-            {
-                NbtCompound structureNbt = NbtIo.readCompressed(
-                    nbtFile.toPath(),
-                    NbtSizeTracker.ofUnlimitedBytes()
-                );
-
-                NbtList sizeList = structureNbt.getList("size", NbtElement.INT_TYPE);
-                int sizeX = sizeList.getInt(0);
-                int sizeY = sizeList.getInt(1);
-                int sizeZ = sizeList.getInt(2);
-
-                int dataVersion = structureNbt.getInt("DataVersion");
-
-                NbtList      paletteList   = structureNbt.getList("palette", NbtElement.COMPOUND_TYPE);
-                BlockState[] structPalette = new BlockState[paletteList.size()];
-
-                for (int i = 0; i < paletteList.size(); i++)
-                {
-                    NbtCompound entry    = paletteList.getCompound(i);
-                    String      blockId  = entry.getString("Name");
-                    NbtCompound propsNbt = entry.contains("Properties")
-                        ? entry.getCompound("Properties") : null;
-
-                    Block      block = Registries.BLOCK.get(Identifier.of(blockId));
-                    BlockState bs    = block.getDefaultState();
-
-                    if (propsNbt != null)
-                    {
-                        StateManager<Block, BlockState> sm = block.getStateManager();
-                        for (String propName : propsNbt.getKeys())
-                        {
-                            Property<?> prop = sm.getProperty(propName);
-                            if (prop != null)
-                            {
-                                bs = applyProperty(bs, prop, propsNbt.getString(propName));
-                            }
-                        }
-                    }
-                    structPalette[i] = bs;
-                }
-
-                int   volume     = sizeX * sizeY * sizeZ;
-                int[] blockArray = new int[volume];
-
-                Map<BlockState, Integer> stateToIndex = new LinkedHashMap<>();
-                stateToIndex.put(Blocks.AIR.getDefaultState(), 0);
-
-                NbtList blocksList = structureNbt.getList("blocks", NbtElement.COMPOUND_TYPE);
-                for (int i = 0; i < blocksList.size(); i++)
-                {
-                    NbtCompound blockEntry = blocksList.getCompound(i);
-                    NbtList     pos        = blockEntry.getList("pos", NbtElement.INT_TYPE);
-                    int         stateIdx   = blockEntry.getInt("state");
-
-                    int x = pos.getInt(0);
-                    int y = pos.getInt(1);
-                    int z = pos.getInt(2);
-
-                    BlockState bs = structPalette[stateIdx];
-
-                    if (!stateToIndex.containsKey(bs))
-                    {
-                        stateToIndex.put(bs, stateToIndex.size());
-                    }
-
-                    int litIdx = y * (sizeX * sizeZ) + z * sizeX + x;
-                    blockArray[litIdx] = stateToIndex.get(bs);
-                }
-
-                NbtList blockStatePalette = new NbtList();
-                for (BlockState bs : stateToIndex.keySet())
-                {
-                    NbtCompound stateNbt = new NbtCompound();
-                    stateNbt.putString("Name", Registries.BLOCK.getId(bs.getBlock()).toString());
-
-                    NbtCompound props = new NbtCompound();
-                    for (Map.Entry<Property<?>, Comparable<?>> e : bs.getEntries().entrySet())
-                    {
-                        props.putString(e.getKey().getName(),
-                            Util.getValueAsString(e.getKey(), e.getValue()));
-                    }
-                    if (!props.isEmpty()) stateNbt.put("Properties", props);
-                    blockStatePalette.add(stateNbt);
-                }
-
-                int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(stateToIndex.size() - 1));
-                LitematicaBitArray bitArray = new LitematicaBitArray(bits, volume);
-                for (int i = 0; i < volume; i++)
-                {
-                    bitArray.setAt(i, blockArray[i]);
-                }
-
-                int nonAirCount = 0;
-                for (int v : blockArray) if (v != 0) nonAirCount++;
-
-                NbtCompound regionPos = new NbtCompound();
-                regionPos.putInt("x", 0);
-                regionPos.putInt("y", 0);
-                regionPos.putInt("z", 0);
-
-                NbtCompound regionSize = new NbtCompound();
-                regionSize.putInt("x", sizeX);
-                regionSize.putInt("y", sizeY);
-                regionSize.putInt("z", sizeZ);
-
-                NbtCompound region = new NbtCompound();
-                region.put("Position",          regionPos);
-                region.put("Size",              regionSize);
-                region.put("BlockStatePalette", blockStatePalette);
-                region.put("BlockStates",       new NbtLongArray(bitArray.getBackingLongArray()));
-                region.put("TileEntities",      new NbtList());
-                region.put("Entities",          new NbtList());
-                region.put("PendingBlockTicks", new NbtList());
-                region.put("PendingFluidTicks", new NbtList());
-
-                NbtCompound enclosingSize = new NbtCompound();
-                enclosingSize.putInt("x", sizeX);
-                enclosingSize.putInt("y", sizeY);
-                enclosingSize.putInt("z", sizeZ);
-
-                NbtCompound metadata = new NbtCompound();
-                metadata.putString("Name",        newName.replace(".litematic", ""));
-                metadata.putString("Description", "");
-                metadata.putString("Author",      "FluxPrint");
-                metadata.putLong("TimeCreated",   System.currentTimeMillis());
-                metadata.putLong("TimeModified",  System.currentTimeMillis());
-                metadata.putInt("TotalBlocks",    nonAirCount);
-                metadata.putInt("TotalVolume",    volume);
-                metadata.putInt("RegionCount",    1);
-                metadata.put("EnclosingSize",     enclosingSize);
-
-                NbtCompound regions = new NbtCompound();
-                regions.put("main", region);
-
-                NbtCompound litematicNbt = new NbtCompound();
-                litematicNbt.putInt("MinecraftDataVersion", dataVersion);
-                litematicNbt.putInt("Version",              6);
-                litematicNbt.putInt("SubVersion",           1);
-                litematicNbt.put("Metadata",                metadata);
-                litematicNbt.put("Regions",                 regions);
-
-                NbtIo.writeCompressed(litematicNbt, outFile.toPath());
-                LogUtils.log("Converted: " + nbtFile.getName() + " - " + newName);
-                converted++;
-            }
-            catch (Exception e)
-            {
-                LogUtils.error("Error converting " + nbtFile.getName() + ": " + e.getMessage());
-                e.printStackTrace();
-                failed++;
-            }
+            conversionFuture = null;
         }
-
-        LogUtils.log("Conversion done — " + converted + " converted, " + failed + " failed.");
 
         if (failed > 0)
         {
-            LogUtils.error(failed + " files failed — check logs.");
+            LogUtils.error(failed + " files failed - check logs.");
             pause("Conversion Failed For " + failed + " Files");
             return;
         }
 
         state = BotState.INITIALIZING;
+    }
+
+    /***
+     * convertOneFile() does the actual .nbt -> .litematic conversion for a single file.
+     * SAFE TO CALL FROM A BACKGROUND THREAD - touches only NBT data, file I/O, and the static
+     * Block registry (which is fully populated by the time the bot starts).
+     */
+    private void convertOneFile(File nbtFile, File outFolder) throws Exception
+    {
+        String newName = nbtFile.getName().replace(".nbt", ".litematic");
+        File   outFile = new File(outFolder, newName);
+
+        if (outFile.exists()) return;
+
+        NbtCompound structureNbt = NbtIo.readCompressed(
+            nbtFile.toPath(),
+            NbtSizeTracker.ofUnlimitedBytes()
+        );
+
+        NbtList sizeList = structureNbt.getList("size", NbtElement.INT_TYPE);
+        int sizeX = sizeList.getInt(0);
+        int sizeY = sizeList.getInt(1);
+        int sizeZ = sizeList.getInt(2);
+
+        int dataVersion = structureNbt.getInt("DataVersion");
+
+        NbtList      paletteList   = structureNbt.getList("palette", NbtElement.COMPOUND_TYPE);
+        BlockState[] structPalette = new BlockState[paletteList.size()];
+
+        for (int i = 0; i < paletteList.size(); i++)
+        {
+            NbtCompound entry    = paletteList.getCompound(i);
+            String      blockId  = entry.getString("Name");
+            NbtCompound propsNbt = entry.contains("Properties")
+                ? entry.getCompound("Properties") : null;
+
+            Block      block = Registries.BLOCK.get(Identifier.of(blockId));
+            BlockState bs    = block.getDefaultState();
+
+            if (propsNbt != null)
+            {
+                StateManager<Block, BlockState> sm = block.getStateManager();
+                for (String propName : propsNbt.getKeys())
+                {
+                    Property<?> prop = sm.getProperty(propName);
+                    if (prop != null)
+                    {
+                        bs = applyProperty(bs, prop, propsNbt.getString(propName));
+                    }
+                }
+            }
+            structPalette[i] = bs;
+        }
+
+        int   volume     = sizeX * sizeY * sizeZ;
+        int[] blockArray = new int[volume];
+
+        Map<BlockState, Integer> stateToIndex = new LinkedHashMap<>();
+        stateToIndex.put(Blocks.AIR.getDefaultState(), 0);
+
+        NbtList blocksList = structureNbt.getList("blocks", NbtElement.COMPOUND_TYPE);
+        for (int i = 0; i < blocksList.size(); i++)
+        {
+            NbtCompound blockEntry = blocksList.getCompound(i);
+            NbtList     pos        = blockEntry.getList("pos", NbtElement.INT_TYPE);
+            int         stateIdx   = blockEntry.getInt("state");
+
+            int x = pos.getInt(0);
+            int y = pos.getInt(1);
+            int z = pos.getInt(2);
+
+            BlockState bs = structPalette[stateIdx];
+
+            if (!stateToIndex.containsKey(bs))
+            {
+                stateToIndex.put(bs, stateToIndex.size());
+            }
+
+            int litIdx = y * (sizeX * sizeZ) + z * sizeX + x;
+            blockArray[litIdx] = stateToIndex.get(bs);
+        }
+
+        NbtList blockStatePalette = new NbtList();
+        for (BlockState bs : stateToIndex.keySet())
+        {
+            NbtCompound stateNbt = new NbtCompound();
+            stateNbt.putString("Name", Registries.BLOCK.getId(bs.getBlock()).toString());
+
+            NbtCompound props = new NbtCompound();
+            for (Map.Entry<Property<?>, Comparable<?>> e : bs.getEntries().entrySet())
+            {
+                props.putString(e.getKey().getName(),
+                    Util.getValueAsString(e.getKey(), e.getValue()));
+            }
+            if (!props.isEmpty()) stateNbt.put("Properties", props);
+            blockStatePalette.add(stateNbt);
+        }
+
+        int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(stateToIndex.size() - 1));
+        LitematicaBitArray bitArray = new LitematicaBitArray(bits, volume);
+        for (int i = 0; i < volume; i++)
+        {
+            bitArray.setAt(i, blockArray[i]);
+        }
+
+        int nonAirCount = 0;
+        for (int v : blockArray) if (v != 0) nonAirCount++;
+
+        NbtCompound regionPos = new NbtCompound();
+        regionPos.putInt("x", 0);
+        regionPos.putInt("y", 0);
+        regionPos.putInt("z", 0);
+
+        NbtCompound regionSize = new NbtCompound();
+        regionSize.putInt("x", sizeX);
+        regionSize.putInt("y", sizeY);
+        regionSize.putInt("z", sizeZ);
+
+        NbtCompound region = new NbtCompound();
+        region.put("Position",          regionPos);
+        region.put("Size",              regionSize);
+        region.put("BlockStatePalette", blockStatePalette);
+        region.put("BlockStates",       new NbtLongArray(bitArray.getBackingLongArray()));
+        region.put("TileEntities",      new NbtList());
+        region.put("Entities",          new NbtList());
+        region.put("PendingBlockTicks", new NbtList());
+        region.put("PendingFluidTicks", new NbtList());
+
+        NbtCompound enclosingSize = new NbtCompound();
+        enclosingSize.putInt("x", sizeX);
+        enclosingSize.putInt("y", sizeY);
+        enclosingSize.putInt("z", sizeZ);
+
+        NbtCompound metadata = new NbtCompound();
+        metadata.putString("Name",        newName.replace(".litematic", ""));
+        metadata.putString("Description", "");
+        metadata.putString("Author",      "FluxPrint");
+        metadata.putLong("TimeCreated",   System.currentTimeMillis());
+        metadata.putLong("TimeModified",  System.currentTimeMillis());
+        metadata.putInt("TotalBlocks",    nonAirCount);
+        metadata.putInt("TotalVolume",    volume);
+        metadata.putInt("RegionCount",    1);
+        metadata.put("EnclosingSize",     enclosingSize);
+
+        NbtCompound regions = new NbtCompound();
+        regions.put("main", region);
+
+        NbtCompound litematicNbt = new NbtCompound();
+        litematicNbt.putInt("MinecraftDataVersion", dataVersion);
+        litematicNbt.putInt("Version",              6);
+        litematicNbt.putInt("SubVersion",           1);
+        litematicNbt.put("Metadata",                metadata);
+        litematicNbt.put("Regions",                 regions);
+
+        NbtIo.writeCompressed(litematicNbt, outFile.toPath());
+        LogUtils.log("Converted: " + nbtFile.getName() + " -> " + newName);
     }
 
     private <T extends Comparable<T>> BlockState applyProperty(BlockState state, Property<T> property, String value)
@@ -632,12 +728,22 @@ public class FluxPrint extends Module
         }
         worldPlacement.addSchematicPlacement(currentPlacement, true);
 
-        getTotalBlocks();
-        totalBlocks = countTotalBlocks();
+
+        matNeeded.clear();
+        totalBlocks = 0;
+        MaterialListSchematic matList = new MaterialListSchematic(currentSchematic, true);
+        for (MaterialListEntry entry : matList.getMaterialsAll())
+        {
+            matNeeded.put(entry.getStack().getItem(), entry.getCountTotal());
+            totalBlocks += entry.getCountTotal();
+        }
 
         LogUtils.log("Schematic loaded. Total blocks to place: " + totalBlocks);
 
-        unplacedCache = new ArrayList<>();
+
+        unplacedCache        = new ArrayList<>();
+        remainingMatsCache   = new HashMap<>();
+        unplacedCacheTimer.ms = 0;
 
         state = BotState.CHEST_SCAN;
     }
@@ -880,31 +986,15 @@ public class FluxPrint extends Module
     }
 
     /***
-     * computeRemainingNeededMaterials() returns a map of item → quantity-still-needed, built by
-     * walking the actual unplaced schematic positions in the world. As the bot places blocks the
-     * map shrinks; once every position for a given block is filled, that item drops out of the map.
+     * computeRemainingNeededMaterials() returns a map of item -> quantity-still-needed.
      *
-     * This is the source of truth for restock decisions
-     *
-     * This also allows other bots to work on the same platform
      */
     private Map<Item, Integer> computeRemainingNeededMaterials()
     {
-        Map<Item, Integer> remaining = new HashMap<>();
+        if (currentSchematic == null || currentPlacement == null) return new HashMap<>();
 
-        if (currentSchematic == null || currentPlacement == null) return remaining;
-
-        for (BlockPos pos : getUnplacedBlocks())
-        {
-            BlockState schemState = getSchemStateAt(pos);
-            if (schemState == null || schemState.isAir()) continue;
-
-            Item item = schemState.getBlock().asItem();
-            if (item == null || item == Items.AIR) continue;
-
-            remaining.merge(item, 1, Integer::sum);
-        }
-        return remaining;
+        getUnplacedBlocks();
+        return remainingMatsCache;
     }
 
     /***
@@ -951,6 +1041,16 @@ public class FluxPrint extends Module
             currentClusterTarget = null;
             BaritoneUtils.forceCancel();
             state = BotState.VERIFYING;
+            return;
+        }
+
+        if (fixErrors.get() && !getWrongBlocks(unplaced).isEmpty())
+        {
+            LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+            LogUtils.log("Wrong block(s) detected — switching to error clearing.");
+            currentClusterTarget = null;
+            BaritoneUtils.forceCancel();
+            state = BotState.CLEARING_ERRORS;
             return;
         }
 
@@ -1066,6 +1166,192 @@ public class FluxPrint extends Module
         baritoneStartTimer.reset();
         clusterArrivalTimer.reset();
         clusterStuckTimer.reset();
+    }
+
+    /***
+     * getWrongBlocks() filters the unplaced list down to positions that are OCCUPIED by a block that
+     * doesn't match the schematic (a "wrong" block), as opposed to "missing" positions that are just
+     * air. Missing positions are the printer's job; wrong positions have to be broken first.
+     *
+     *
+     */
+    private List<BlockPos> getWrongBlocks(List<BlockPos> unplaced)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        List<BlockPos> wrong = new ArrayList<>();
+        if (mc == null || mc.world == null) return wrong;
+
+        for (BlockPos pos : unplaced)
+        {
+            if (!mc.world.getBlockState(pos).isAir()) wrong.add(pos);
+        }
+        return wrong;
+    }
+
+    /***
+     * doClearErrors() walks to each wrong block (nearest first) and breaks it so the printer can
+     * re-place the correct block. A per-block timeout moves stubborn blocks to a give-up list so a
+     * single un-mineable block can't replace the old circle with a new one.
+     */
+    private void doClearErrors()
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null || mc.world == null || mc.interactionManager == null) return;
+
+        LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+
+        List<BlockPos> wrong = getWrongBlocks(getUnplacedBlocks());
+
+        if (wrong.isEmpty())
+        {
+            LogUtils.log("No wrong blocks remaining — back to placing.");
+            currentErrorTarget = null;
+            walkingToError     = false;
+            baritoneArrived    = false;
+            BaritoneUtils.forceCancel();
+            state = BotState.PLACING;
+            return;
+        }
+
+        if (currentErrorTarget == null || !wrong.contains(currentErrorTarget))
+        {
+            currentErrorTarget = nearestPos(wrong, mc.player.getPos());
+            walkingToError     = false;
+            baritoneArrived    = false;
+        }
+
+        if (currentErrorTarget == null) return;
+
+        if (mc.world.getBlockState(currentErrorTarget).isAir())
+        {
+            currentErrorTarget = null;
+            return;
+        }
+
+        if (!walkingToError)
+        {
+            LogUtils.log("Walking to wrong block at " + currentErrorTarget);
+            BaritoneUtils.goToNear(currentErrorTarget, 2);
+            walkingToError  = true;
+            baritoneArrived = false;
+            baritoneStartTimer.reset();
+            return;
+        }
+
+        if (!baritoneStartTimer.hasPassed(250)) return;
+        if (BaritoneUtils.isPathing()) return;
+
+        if (!baritoneArrived)
+        {
+            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(currentErrorTarget));
+            if (dist > 4.0)
+            {
+                LogUtils.log("Not close enough to wrong block ("
+                    + String.format("%.1f", dist) + ") re-pathing.");
+                BaritoneUtils.goToNear(currentErrorTarget, 2);
+                baritoneStartTimer.reset();
+                return;
+            }
+            LogUtils.log("Arrived at wrong block " + currentErrorTarget + " — breaking.");
+            baritoneArrived = true;
+            errorBreakTimer.reset();
+            return;
+        }
+
+        if (errorBreakTimer.hasPassedDouble(errorBreakTimeout.get() * 1000))
+        {
+            LogUtils.error("Could not break wrong block at " + currentErrorTarget
+                + " within " + errorBreakTimeout.get() + "s — skipping it.");
+            unbreakableErrors.add(currentErrorTarget.toImmutable());
+            currentErrorTarget = null;
+            walkingToError     = false;
+            baritoneArrived    = false;
+
+            unplacedCacheTimer.ms = 0;
+            return;
+        }
+
+        if (breakBlock(currentErrorTarget))
+        {
+            LogUtils.log("Broke wrong block at " + currentErrorTarget + ".");
+            currentErrorTarget = null;
+            walkingToError     = false;
+            baritoneArrived    = false;
+            unplacedCacheTimer.ms = 0;
+        }
+    }
+
+    /***
+     * nearestPos() returns the position in the list closest to from, or null if the list is empty.
+     */
+    private BlockPos nearestPos(List<BlockPos> positions, Vec3d from)
+    {
+        BlockPos best     = null;
+        double   bestDist = Double.MAX_VALUE;
+        for (BlockPos pos : positions)
+        {
+            double d = from.squaredDistanceTo(Vec3d.ofCenter(pos));
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best     = pos;
+            }
+        }
+        return best;
+    }
+
+    /***
+     * breakBlock() rotates the player to face the block and mines it. Returns true once the block is
+     * air (instantly in creative, after enough ticks in survival).
+     */
+    private boolean breakBlock(BlockPos pos)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null || mc.world == null || mc.interactionManager == null) return true;
+
+        if (mc.world.getBlockState(pos).isAir()) return true;
+
+        lookAt(Vec3d.ofCenter(pos));
+        mc.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
+        mc.player.swingHand(Hand.MAIN_HAND);
+
+        return mc.world.getBlockState(pos).isAir();
+    }
+
+    /***
+     * lookAt() points the player's view at a world position. Servers commonly range/line-of-sight
+     * check block interactions, so facing the target before interacting/mining makes it reliable.
+     */
+    private void lookAt(Vec3d target)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null) return;
+
+        Vec3d  eye   = mc.player.getEyePos();
+        double dx    = target.x - eye.x;
+        double dy    = target.y - eye.y;
+        double dz    = target.z - eye.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+
+        float yaw   = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        float pitch = (float) (-Math.toDegrees(Math.atan2(dy, horiz)));
+
+        mc.player.setYaw(yaw);
+        mc.player.setPitch(pitch);
+    }
+
+    /***
+     * interactBlockLooking() faces the block, then right-clicks it. Use for opening chests / tables /
+     * pressing buttons so the interaction isn't rejected for not looking at the target.
+     */
+    private void interactBlockLooking(BlockPos pos, Direction face)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null || mc.interactionManager == null) return;
+
+        lookAt(Vec3d.ofCenter(pos));
+        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), face, pos, false);
+        mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
     }
 
     /***
@@ -1259,13 +1545,7 @@ public class FluxPrint extends Module
 
         if (!(chestHandler instanceof GenericContainerScreenHandler chest))
         {
-            BlockHitResult hit = new BlockHitResult(
-                Vec3d.ofCenter(outputChest),
-                Direction.UP,
-                outputChest,
-                false
-            );
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+            interactBlockLooking(outputChest, Direction.UP);
             return;
         }
 
@@ -1367,12 +1647,7 @@ public class FluxPrint extends Module
 
         if (!(handler instanceof CartographyTableScreenHandler tableScreen))
         {
-            BlockHitResult hit = new BlockHitResult(
-                Vec3d.ofCenter(cartTable),
-                Direction.UP,
-                cartTable,
-                false);
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+            interactBlockLooking(cartTable, Direction.UP);
             return;
         }
 
@@ -1514,6 +1789,7 @@ public class FluxPrint extends Module
                 false
             );
 
+            lookAt(Vec3d.ofCenter(restButton));
             mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
             LogUtils.log("Reset Button Pressed at " + restButton);
             resetWaitTimer.reset();
@@ -1607,6 +1883,7 @@ public class FluxPrint extends Module
         currentSchematic = null;
         currentPlacement = null;
         unplacedCache    = new ArrayList<>();
+        unbreakableErrors.clear();
 
         LogUtils.log("Moving to Schematic #" + nextIndex + ": " + schemFiles[nextIndex].getName());
         state = BotState.ANALYZING;
@@ -1642,6 +1919,7 @@ public class FluxPrint extends Module
             case DROPPING_EXCESS     -> doDropExcess();
             case RESTOCKING          -> doRestock();
             case PLACING             -> doPlacing();
+            case CLEARING_ERRORS     -> doClearErrors();
             case VERIFYING           -> doVerify();
             case CAPTURE_MAP         -> doCaptureMap();
             case LOCK_MAP            -> lockMapProc();
@@ -1665,6 +1943,8 @@ public class FluxPrint extends Module
     public void onActivate()
     {
         resetAllFlags();
+
+        conversionFuture = null;
         state = BotState.IDLE;
         LogUtils.log("FluxPrint activated.");
     }
@@ -1709,10 +1989,14 @@ public class FluxPrint extends Module
         clusterNearestToPlayer    = false;
         clearAreaStarted          = false;
         walkingToDropPos          = false;
+        walkingToError            = false;
+        awaitingChestRefill       = false;
         currentGrabItem           = null;
         currentChestIndex         = 0;
         currentClusterTarget      = null;
+        currentErrorTarget        = null;
         nudgeDirIdx               = 0;
+        unbreakableErrors.clear();
     }
 
     /***
@@ -1795,8 +2079,11 @@ public class FluxPrint extends Module
     }
 
     /***
-     * getUnplacedBlocks() walks every region of the active schematic and returns world positions whose
-     * world block state doesn't match the schematic. Results are cached for UNPLACED_CACHE_MS.
+     * getUnplacedBlocks() walks every region of the active schematic and returns world positions
+     * whose world block state doesn't match the schematic. The scan ALSO populates
+     * remainingMatsCache (item -> count-still-needed) in the same pass, so anything that needs
+     * the materials breakdown gets it for free without re-iterating.
+     *
      */
     private List<BlockPos> getUnplacedBlocks()
     {
@@ -1805,12 +2092,21 @@ public class FluxPrint extends Module
             return unplacedCache;
         }
 
-        if (currentPlacement == null) return new ArrayList<>();
+        if (currentPlacement == null)
+        {
+            unplacedCache      = new ArrayList<>();
+            remainingMatsCache = new HashMap<>();
+            return unplacedCache;
+        }
 
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.player == null || mc.interactionManager == null || mc.world == null) return new ArrayList<>();
+        if (mc.player == null || mc.interactionManager == null || mc.world == null)
+        {
+            return unplacedCache;
+        }
 
-        List<BlockPos> unplacedBlocks = new ArrayList<>();
+        List<BlockPos>     unplacedBlocks = new ArrayList<>();
+        Map<Item, Integer> remainingMats  = new HashMap<>();
 
         for (Map.Entry<String, BlockPos> entry : currentSchematic.getAreaPositions().entrySet())
         {
@@ -1846,17 +2142,26 @@ public class FluxPrint extends Module
 
                         if (!worldState.equals(schemState))
                         {
+                            if (unbreakableErrors.contains(worldPos)) continue;
+
                             unplacedBlocks.add(worldPos);
+
+                            Item item = schemState.getBlock().asItem();
+                            if (item != null && item != Items.AIR)
+                            {
+                                remainingMats.merge(item, 1, Integer::sum);
+                            }
                         }
                     }
                 }
             }
         }
 
-        unplacedCache = unplacedBlocks;
+        unplacedCache      = unplacedBlocks;
+        remainingMatsCache = remainingMats;
         unplacedCacheTimer.reset();
 
-        LogUtils.log("Cache updated — " + unplacedBlocks.size() + " blocks remaining.");
+        LogUtils.log("Cache updated - " + unplacedBlocks.size() + " blocks remaining.");
         return unplacedCache;
     }
 
@@ -1904,25 +2209,76 @@ public class FluxPrint extends Module
             clusters.computeIfAbsent(cellX + "," + cellZ, k -> new ArrayList<>()).add(pos);
         }
 
-        BlockPos restockCorner = restockMin.get();
+        return selectCluster(clusters, playerPos);
+    }
 
-        if (!clusterNearestToPlayer)
+    /***
+     * selectCluster() chooses which cluster to head for next according to the configured placement
+     * algorithm. The doPlacing() migration logic decides when to actually move on, so this just needs
+     * to return the "best next" cluster for the current ordering.
+     */
+    private BlockPos selectCluster(Map<String, List<BlockPos>> clusters, Vec3d playerPos)
+    {
+        switch (placementAlgo.get())
         {
-            // cluster furthest from the restock station
-            clusterNearestToPlayer = true;
-            return clusters.values().stream()
-                .max(Comparator.comparingDouble(cluster ->
-                {
-                    double avgX = cluster.stream().mapToInt(BlockPos::getX).average().orElse(0);
-                    double avgZ = cluster.stream().mapToInt(BlockPos::getZ).average().orElse(0);
-                    return MathUtils.getSquaredDistance(avgX, schemPos.get().getY(), avgZ,
-                        restockCorner.getX(), restockCorner.getY(), restockCorner.getZ());
-                }))
-                .map(this::averageClusterPos)
-                .orElse(null);
-        }
+            case NEAREST_FIRST ->
+            {
+                return nearestClusterToPlayer(clusters, playerPos);
+            }
 
-        // cluster nearest to the player
+            case SCANLINE ->
+            {
+                return clusters.values().stream()
+                    .map(this::averageClusterPos)
+                    .min(Comparator.comparingInt(BlockPos::getZ).thenComparingInt(BlockPos::getX))
+                    .orElse(null);
+            }
+
+            case SPIRAL ->
+            {
+                BlockPos center = new BlockPos(
+                    schemPos.get().getX() + SCHEMATIC_CENTER,
+                    schemPos.get().getY(),
+                    schemPos.get().getZ() + SCHEMATIC_CENTER);
+
+                return clusters.values().stream()
+                    .map(this::averageClusterPos)
+                    .min(Comparator.comparingDouble(p -> MathUtils.getSquaredDistance(
+                        p.getX(), center.getY(), p.getZ(),
+                        center.getX(), center.getY(), center.getZ())))
+                    .orElse(null);
+            }
+
+            default -> // FURTHEST_FIRST
+            {
+                if (!clusterNearestToPlayer)
+                {
+
+                    clusterNearestToPlayer = true;
+                    BlockPos restockCorner = restockMin.get();
+                    return clusters.values().stream()
+                        .max(Comparator.comparingDouble(cluster ->
+                        {
+                            double avgX = cluster.stream().mapToInt(BlockPos::getX).average().orElse(0);
+                            double avgZ = cluster.stream().mapToInt(BlockPos::getZ).average().orElse(0);
+                            return MathUtils.getSquaredDistance(avgX, schemPos.get().getY(), avgZ,
+                                restockCorner.getX(), restockCorner.getY(), restockCorner.getZ());
+                        }))
+                        .map(this::averageClusterPos)
+                        .orElse(null);
+                }
+
+                return nearestClusterToPlayer(clusters, playerPos);
+            }
+        }
+    }
+
+    /***
+     * nearestClusterToPlayer() returns the center of the cluster whose average position is closest to
+     * the player, minimising travel.
+     */
+    private BlockPos nearestClusterToPlayer(Map<String, List<BlockPos>> clusters, Vec3d playerPos)
+    {
         return clusters.values().stream()
             .min(Comparator.comparingDouble(cluster ->
             {
@@ -2140,38 +2496,22 @@ public class FluxPrint extends Module
         ScreenHandler handler = mc.player.currentScreenHandler;
         if (!(handler instanceof GenericContainerScreenHandler chestScreen))
         {
-            BlockHitResult hit = new BlockHitResult(
-                Vec3d.ofCenter(chestPos),
-                Direction.DOWN,
-                chestPos,
-                false);
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+
+            interactBlockLooking(chestPos, Direction.UP);
+            refillWaitTimer.reset();
+            awaitingChestRefill = false;
             return;
         }
 
         if (!itemGrabTimer.hasPassed((int)(itemTakeDelay.get() * 1000))) return;
 
-        int chestSize = chestScreen.getRows() * 9;
+        ItemStack slot0   = chestScreen.getSlot(0).getStack();
+        boolean   hasItem = !slot0.isEmpty() && slot0.getItem() == currentGrabItem;
 
-        for (int slot = 0; slot < chestSize; slot++)
+        if (hasItem && awaitingChestRefill) return;
+
+        if (hasItem)
         {
-            ItemStack stack = chestScreen.getSlot(slot).getStack();
-
-            if (stack.isEmpty()) continue;
-            if (stack.getItem() != currentGrabItem) continue;
-
-            LogUtils.log("Have " + countItemInInventory(currentGrabItem) + " / Need " + needed);
-            if (countItemInInventory(currentGrabItem) >= needed)
-            {
-                LogUtils.log("Reached needed amount — closing chest.");
-                mc.player.closeHandledScreen();
-                currentGrabItem   = null;
-                currentChestIndex = 0;
-                walkingToStation  = false;
-                baritoneArrived   = false;
-                return;
-            }
-
             if (getFreeInventorySlots() <= 1)
             {
                 LogUtils.log("Inventory full mid-grab (keeping 1 slot for food) — closing chest.");
@@ -2184,12 +2524,30 @@ public class FluxPrint extends Module
                 return;
             }
 
-            mc.interactionManager.clickSlot(chestScreen.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+            LogUtils.log("Taking slot 0 — have " + countItemInInventory(currentGrabItem) + " / need " + needed);
+            mc.interactionManager.clickSlot(chestScreen.syncId, 0, 0, SlotActionType.QUICK_MOVE, mc.player);
             itemGrabTimer.reset();
+            refillWaitTimer.reset();
+            awaitingChestRefill = true;
+
+            if (countItemInInventory(currentGrabItem) >= needed)
+            {
+                LogUtils.log("Reached needed amount — closing chest.");
+                mc.player.closeHandledScreen();
+                currentGrabItem   = null;
+                currentChestIndex = 0;
+                walkingToStation  = false;
+                baritoneArrived   = false;
+            }
             return;
         }
 
-        LogUtils.log("Chest at " + chestPos + " is empty for " + currentGrabItem + " — moving to next chest.");
+        awaitingChestRefill = false;
+
+        if (!refillWaitTimer.hasPassedDouble(chestRefillWait.get() * 1000)) return;
+
+        LogUtils.log("Chest at " + chestPos + " drained (no refill in "
+            + chestRefillWait.get() + "s) for " + currentGrabItem + " — moving to next chest.");
         mc.player.closeHandledScreen();
         currentChestIndex++;
         walkingToStation = false;
@@ -2216,13 +2574,7 @@ public class FluxPrint extends Module
         ScreenHandler handler = mc.player.currentScreenHandler;
         if (!(handler instanceof GenericContainerScreenHandler chestScreen))
         {
-            BlockHitResult hit = new BlockHitResult(
-                Vec3d.ofCenter(chestPos),
-                Direction.UP,
-                chestPos,
-                false
-            );
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+            interactBlockLooking(chestPos, Direction.UP);
             return;
         }
 
@@ -2280,13 +2632,7 @@ public class FluxPrint extends Module
         ScreenHandler handler = mc.player.currentScreenHandler;
         if (!(handler instanceof GenericContainerScreenHandler chestScreen))
         {
-            BlockHitResult hit = new BlockHitResult(
-                Vec3d.ofCenter(chestPos),
-                Direction.UP,
-                chestPos,
-                false
-            );
-            mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+            interactBlockLooking(chestPos, Direction.UP);
             return;
         }
 

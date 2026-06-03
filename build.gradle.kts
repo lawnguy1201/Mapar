@@ -43,14 +43,15 @@ dependencies {
     // Printer
     modImplementation(files("libs/litematica-printer-1_21.4-3.3.16.jar"))
 
-    // Baritone — user must install separately
-    modImplementation("meteordevelopment:baritone:1.21.4-SNAPSHOT")
-
-
     modImplementation("dev.babbaj:nether-pathfinder:1.6")
     include("dev.babbaj:nether-pathfinder:1.6")
 
+
     modImplementation(libs.meteor.client)
+    include(libs.meteor.client)
+
+    modImplementation("meteordevelopment:baritone:1.21.4-SNAPSHOT")
+    include("meteordevelopment:baritone:1.21.4-SNAPSHOT")
 }
 
 java {
