@@ -146,15 +146,6 @@ public class FluxPrint extends Module
         .build()
     );
 
-    private final Setting<Double> chestRefillWait = sgTiming.add(new DoubleSetting.Builder()
-        .name("chest refill wait")
-        .description("Restock chests are hopper-fed into slot 0. After taking slot 0, wait this many seconds for the hopper to refill it before declaring the chest drained and moving to the next chest.")
-        .defaultValue(3.0)
-        .min(0)
-        .sliderRange(0, 30)
-        .build()
-    );
-
     private final Setting<Double> errorBreakTimeout = sgTiming.add(new DoubleSetting.Builder()
         .name("error break timeout")
         .description("Maximum seconds to spend breaking a single wrong block before giving up on it (so a stubborn block doesn't create a new infinite loop).")
@@ -331,7 +322,6 @@ public class FluxPrint extends Module
     private final Timer baritoneStartTimer   = new Timer();
     private final Timer clearAreaTimer       = new Timer();
     private final Timer clusterStuckTimer    = new Timer();
-    private final Timer refillWaitTimer      = new Timer();
     private final Timer errorBreakTimer      = new Timer();
     private       int   nudgeDirIdx          = 0;
 
@@ -352,7 +342,7 @@ public class FluxPrint extends Module
     private boolean clearAreaStarted          = false;
     private boolean walkingToDropPos          = false;
     private boolean walkingToError            = false;
-    private boolean awaitingChestRefill       = false;
+    private boolean tookFirstSlot             = false;
 
     private boolean baritoneArrived = false;
 
@@ -1169,11 +1159,10 @@ public class FluxPrint extends Module
     }
 
     /***
-     * getWrongBlocks() filters the unplaced list down to positions that are OCCUPIED by a block that
-     * doesn't match the schematic (a "wrong" block), as opposed to "missing" positions that are just
-     * air. Missing positions are the printer's job; wrong positions have to be broken first.
-     *
-     *
+     * getWrongBlocks() returns positions that are currently OCCUPIED by a block that doesn't match the
+     * schematic (a "wrong" block the printer can't fix on its own), as opposed to "missing" positions
+     * that are just air. The world and schematic states are both read live so a block the printer just
+     * placed correctly is never mistaken for a wrong block.
      */
     private List<BlockPos> getWrongBlocks(List<BlockPos> unplaced)
     {
@@ -1183,7 +1172,13 @@ public class FluxPrint extends Module
 
         for (BlockPos pos : unplaced)
         {
-            if (!mc.world.getBlockState(pos).isAir()) wrong.add(pos);
+            BlockState worldState = mc.world.getBlockState(pos);
+            if (worldState.isAir()) continue;
+
+            BlockState schemState = getSchemStateAt(pos);
+            if (schemState == null || schemState.isAir()) continue;
+
+            if (!worldState.equals(schemState)) wrong.add(pos);
         }
         return wrong;
     }
@@ -1990,7 +1985,7 @@ public class FluxPrint extends Module
         clearAreaStarted          = false;
         walkingToDropPos          = false;
         walkingToError            = false;
-        awaitingChestRefill       = false;
+        tookFirstSlot             = false;
         currentGrabItem           = null;
         currentChestIndex         = 0;
         currentClusterTarget      = null;
@@ -2464,6 +2459,7 @@ public class FluxPrint extends Module
             BaritoneUtils.goToNear(chestPos, 2);
             walkingToStation = true;
             baritoneArrived  = false;
+            tookFirstSlot    = false;
             baritoneStartTimer.reset();
             return;
         }
@@ -2496,22 +2492,68 @@ public class FluxPrint extends Module
         ScreenHandler handler = mc.player.currentScreenHandler;
         if (!(handler instanceof GenericContainerScreenHandler chestScreen))
         {
-
             interactBlockLooking(chestPos, Direction.UP);
-            refillWaitTimer.reset();
-            awaitingChestRefill = false;
             return;
         }
 
         if (!itemGrabTimer.hasPassed((int)(itemTakeDelay.get() * 1000))) return;
 
-        ItemStack slot0   = chestScreen.getSlot(0).getStack();
-        boolean   hasItem = !slot0.isEmpty() && slot0.getItem() == currentGrabItem;
+        int chestSize = chestScreen.getRows() * 9;
 
-        if (hasItem && awaitingChestRefill) return;
-
-        if (hasItem)
+        if (!tookFirstSlot)
         {
+            tookFirstSlot = true;
+            ItemStack slot0 = chestScreen.getSlot(0).getStack();
+
+            if (!slot0.isEmpty() && slot0.getItem() == currentGrabItem)
+            {
+                if (getFreeInventorySlots() <= 1)
+                {
+                    LogUtils.log("Inventory full mid-grab (keeping 1 slot for food) — closing chest.");
+                    mc.player.closeHandledScreen();
+                    currentGrabItem   = null;
+                    currentChestIndex = 0;
+                    walkingToStation  = false;
+                    baritoneArrived   = false;
+                    state = BotState.PLACING;
+                    return;
+                }
+
+                LogUtils.log("Taking slot 0 — have " + countItemInInventory(currentGrabItem) + " / need " + needed);
+                mc.interactionManager.clickSlot(chestScreen.syncId, 0, 0, SlotActionType.QUICK_MOVE, mc.player);
+                itemGrabTimer.reset();
+
+                if (countItemInInventory(currentGrabItem) >= needed)
+                {
+                    LogUtils.log("Reached needed amount — closing chest.");
+                    mc.player.closeHandledScreen();
+                    currentGrabItem   = null;
+                    currentChestIndex = 0;
+                    walkingToStation  = false;
+                    baritoneArrived   = false;
+                }
+                return;
+            }
+        }
+
+        for (int slot = 1; slot < chestSize; slot++)
+        {
+            ItemStack stack = chestScreen.getSlot(slot).getStack();
+
+            if (stack.isEmpty()) continue;
+            if (stack.getItem() != currentGrabItem) continue;
+
+            if (countItemInInventory(currentGrabItem) >= needed)
+            {
+                LogUtils.log("Reached needed amount — closing chest.");
+                mc.player.closeHandledScreen();
+                currentGrabItem   = null;
+                currentChestIndex = 0;
+                walkingToStation  = false;
+                baritoneArrived   = false;
+                return;
+            }
+
             if (getFreeInventorySlots() <= 1)
             {
                 LogUtils.log("Inventory full mid-grab (keeping 1 slot for food) — closing chest.");
@@ -2524,30 +2566,12 @@ public class FluxPrint extends Module
                 return;
             }
 
-            LogUtils.log("Taking slot 0 — have " + countItemInInventory(currentGrabItem) + " / need " + needed);
-            mc.interactionManager.clickSlot(chestScreen.syncId, 0, 0, SlotActionType.QUICK_MOVE, mc.player);
+            mc.interactionManager.clickSlot(chestScreen.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
             itemGrabTimer.reset();
-            refillWaitTimer.reset();
-            awaitingChestRefill = true;
-
-            if (countItemInInventory(currentGrabItem) >= needed)
-            {
-                LogUtils.log("Reached needed amount — closing chest.");
-                mc.player.closeHandledScreen();
-                currentGrabItem   = null;
-                currentChestIndex = 0;
-                walkingToStation  = false;
-                baritoneArrived   = false;
-            }
             return;
         }
 
-        awaitingChestRefill = false;
-
-        if (!refillWaitTimer.hasPassedDouble(chestRefillWait.get() * 1000)) return;
-
-        LogUtils.log("Chest at " + chestPos + " drained (no refill in "
-            + chestRefillWait.get() + "s) for " + currentGrabItem + " — moving to next chest.");
+        LogUtils.log("Chest at " + chestPos + " empty for " + currentGrabItem + " — moving to next chest.");
         mc.player.closeHandledScreen();
         currentChestIndex++;
         walkingToStation = false;
