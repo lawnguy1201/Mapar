@@ -54,6 +54,23 @@ public class BaritoneUtils {
 	}
 
     /***
+     * Returns whether Baritone is currently allowed to break blocks while pathing.
+     */
+    public static boolean getAllowBreak()
+    {
+        return BaritoneAPI.getSettings().allowBreak.value;
+    }
+
+    /***
+     * Sets whether Baritone may break blocks while pathing. Turn this off so it never mines
+     * already-placed schematic blocks to reach a goal.
+     */
+    public static void setAllowBreak(boolean value)
+    {
+        BaritoneAPI.getSettings().allowBreak.value = value;
+    }
+
+    /***
      * Gets the current Baritone instance
      * @return the current baritone stance
      */

@@ -30,6 +30,7 @@ import baritone.api.BaritoneAPI;
 // minecraft
 import net.minecraft.block.*;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.inventory.Inventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -107,6 +108,20 @@ public class FluxPrint extends Module
         .build()
     );
 
+    private final Setting<List<Block>> neverBreakBlocks = sgGeneral.add(new BlockListSetting.Builder()
+        .name("never break blocks")
+        .description("Blocks the bot will never break or treat as wrong, even when they don't match the schematic. Use this for your platform base (e.g. obsidian / sea lanterns under the carpets) so the noobline and base layer aren't mistaken for placement errors.")
+        .defaultValue(List.of(Blocks.OBSIDIAN, Blocks.SEA_LANTERN))
+        .build()
+    );
+
+    private final Setting<Boolean> ignoreSupportLayer = sgGeneral.add(new BoolSetting.Builder()
+        .name("ignore support layer")
+        .description("Treat any schematic block that has another block on top of it as support and accept whatever is already in the world there. This lets the map finish even though your platform base never matches the schematic's base. Only the top block of each column (the carpets) is placed and verified. Missing support (air) is still built.")
+        .defaultValue(true)
+        .build()
+    );
+
     // timing shit
     private final SettingGroup sgTiming = settings.createGroup("Timing");
 
@@ -152,6 +167,23 @@ public class FluxPrint extends Module
         .defaultValue(8.0)
         .min(1)
         .sliderRange(1, 60)
+        .build()
+    );
+
+    private final Setting<Boolean> pathUnstuckEnabled = sgTiming.add(new BoolSetting.Builder()
+        .name("path unstuck")
+        .description("If Baritone is pathing but the player stops moving (a known Baritone wedge), nudge the player to dislodge it, like moving manually does.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> pathStuckTimeout = sgTiming.add(new DoubleSetting.Builder()
+        .name("path stuck timeout")
+        .description("Seconds the player can stay still while Baritone is pathing before being nudged loose.")
+        .defaultValue(3.0)
+        .min(1)
+        .sliderRange(1, 30)
+        .visible(pathUnstuckEnabled::get)
         .build()
     );
 
@@ -308,6 +340,7 @@ public class FluxPrint extends Module
 
     private final Map<Block, List<BlockPos>> chestMap     = new HashMap<>();
     private final Map<Item, Integer>         matNeeded    = new HashMap<>();
+    private final Set<Item>                  exhaustedChests = new HashSet<>();
     private List<BlockPos>                   unplacedCache = new ArrayList<>();
 
     private Map<Item, Integer>               remainingMatsCache = new HashMap<>();
@@ -323,6 +356,8 @@ public class FluxPrint extends Module
     private final Timer clearAreaTimer       = new Timer();
     private final Timer clusterStuckTimer    = new Timer();
     private final Timer errorBreakTimer      = new Timer();
+    private final Timer pathStuckTimer       = new Timer();
+    private       Vec3d pathStuckPos         = null;
     private       int   nudgeDirIdx          = 0;
 
     private boolean walkingToStation          = false;
@@ -342,18 +377,19 @@ public class FluxPrint extends Module
     private boolean clearAreaStarted          = false;
     private boolean walkingToDropPos          = false;
     private boolean walkingToError            = false;
-    private boolean tookFirstSlot             = false;
 
     private boolean baritoneArrived = false;
 
     private BlockPos        currentErrorTarget = null;
     private final Set<BlockPos> unbreakableErrors = new HashSet<>();
+    private boolean         prevAllowBreak     = true;
 
     private static final int  SCHEMATIC_SIZE    = 128;
     private static final int  SCHEMATIC_CENTER  = SCHEMATIC_SIZE / 2;
     private static final long UNPLACED_CACHE_MS = 250;
     private static final int  CLUSTER_SIZE      = 8;
     private static final int  FOOD_SLOT_COUNT   = 2;
+    private static final int  MIN_GRAB_COUNT    = 32;
 
     private int      totalBlocks          = 0;
     private int      currentChestIndex    = 0;
@@ -809,6 +845,7 @@ public class FluxPrint extends Module
             currentGrabItem   = null;
             currentChestIndex = 0;
             baritoneArrived   = false;
+            exhaustedChests.clear();
             state = BotState.PLACING;
             return;
         }
@@ -820,6 +857,7 @@ public class FluxPrint extends Module
             currentGrabItem   = null;
             currentChestIndex = 0;
             baritoneArrived   = false;
+            exhaustedChests.clear();
             state = BotState.PLACING;
             return;
         }
@@ -871,11 +909,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(dropPos));
             if (dist > 4.0)
             {
@@ -885,6 +923,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at drop position.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1159,6 +1198,49 @@ public class FluxPrint extends Module
     }
 
     /***
+     * checkPathStuck() detects the known Baritone wedge where it reports pathing but the player has
+     * stopped moving, and nudges the player loose the same way moving manually does. PLACING and
+     * RESETTING_PLATFORM are skipped: the former has its own cluster nudge, the latter is mining via
+     * clearArea and must not be cancelled.
+     */
+    private void checkPathStuck()
+    {
+        if (!pathUnstuckEnabled.get()) return;
+
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null) return;
+
+        if (state == BotState.PLACING || state == BotState.RESETTING_PLATFORM || !BaritoneUtils.isPathing())
+        {
+            pathStuckPos = null;
+            return;
+        }
+
+        Vec3d pos = mc.player.getPos();
+
+        if (pathStuckPos == null || pos.distanceTo(pathStuckPos) > 0.5)
+        {
+            pathStuckPos = pos;
+            pathStuckTimer.reset();
+            return;
+        }
+
+        if (pathStuckTimer.hasPassedDouble(pathStuckTimeout.get() * 1000))
+        {
+            LogUtils.log("Baritone stuck — nudging player to dislodge.");
+            BaritoneUtils.forceCancel();
+
+            double angle = Math.random() * Math.PI * 2;
+            double vy    = mc.player.isOnGround() ? 0.42 : mc.player.getVelocity().y;
+            mc.player.setVelocity(Math.cos(angle) * 0.4, vy, Math.sin(angle) * 0.4);
+            mc.player.velocityModified = true;
+
+            baritoneStartTimer.reset();
+            pathStuckPos = null;
+        }
+    }
+
+    /***
      * getWrongBlocks() returns positions that are currently OCCUPIED by a block that doesn't match the
      * schematic (a "wrong" block the printer can't fix on its own), as opposed to "missing" positions
      * that are just air. The world and schematic states are both read live so a block the printer just
@@ -1233,11 +1315,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(currentErrorTarget));
             if (dist > 4.0)
             {
@@ -1248,6 +1330,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at wrong block " + currentErrorTarget + " — breaking.");
+            BaritoneUtils.forceCancel();
             baritoneArrived = true;
             errorBreakTimer.reset();
             return;
@@ -1304,13 +1387,34 @@ public class FluxPrint extends Module
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc == null || mc.player == null || mc.world == null || mc.interactionManager == null) return true;
 
-        if (mc.world.getBlockState(pos).isAir()) return true;
+        BlockState worldState = mc.world.getBlockState(pos);
+        if (worldState.isAir()) return true;
+        if (neverBreakBlocks.get().contains(worldState.getBlock())) return true;
+        if (isContainer(pos)) return true;
 
         lookAt(Vec3d.ofCenter(pos));
         mc.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
         mc.player.swingHand(Hand.MAIN_HAND);
 
         return mc.world.getBlockState(pos).isAir();
+    }
+
+    /***
+     * isContainer() returns true if the block at pos holds an inventory (chest, barrel, shulker, hopper,
+     * furnace, etc.) so the bot never paths to or breaks storage blocks.
+     */
+    private boolean isContainer(BlockPos pos)
+    {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null) return false;
+
+        if (mc.world.getBlockEntity(pos) instanceof Inventory) return true;
+
+        Block block = mc.world.getBlockState(pos).getBlock();
+        return block instanceof ChestBlock
+            || block instanceof EnderChestBlock
+            || block instanceof ShulkerBoxBlock
+            || block instanceof BarrelBlock;
     }
 
     /***
@@ -1389,11 +1493,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(mapChest));
             if (dist > 4.0)
             {
@@ -1403,6 +1507,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at map chest.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1438,11 +1543,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(schemCenter));
             if (dist > 4.0)
             {
@@ -1452,6 +1557,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at platform center.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1515,11 +1621,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(outputChest));
             if (dist > 4.0)
             {
@@ -1529,6 +1635,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at output chest.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1617,11 +1724,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(cartTable));
             if (dist > 4.0)
             {
@@ -1631,6 +1738,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at cartography table.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1741,11 +1849,11 @@ public class FluxPrint extends Module
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(restButton));
             if (dist > 4.0)
             {
@@ -1755,6 +1863,7 @@ public class FluxPrint extends Module
                 return;
             }
             LogUtils.log("Arrived at reset button.");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -1824,6 +1933,7 @@ public class FluxPrint extends Module
         if (!clearAreaStarted)
         {
             LogUtils.log("Clearing platform " + bounds[0] + " → " + bounds[1] + " via Baritone clearArea.");
+            BaritoneUtils.setAllowBreak(true);
             BaritoneAPI.getProvider().getPrimaryBaritone()
                 .getBuilderProcess().clearArea(bounds[0], bounds[1]);
             clearAreaStarted = true;
@@ -1837,6 +1947,7 @@ public class FluxPrint extends Module
             LogUtils.error("Clear-area timed out after " + clearAreaMaxSeconds.get()
                 + "s — cancelling and moving on.");
             BaritoneUtils.forceCancel();
+            BaritoneUtils.setAllowBreak(false);
             advanceToNextSchematic();
             return;
         }
@@ -1853,6 +1964,7 @@ public class FluxPrint extends Module
 
         LogUtils.log("Platform cleared!");
         BaritoneUtils.forceCancel();
+        BaritoneUtils.setAllowBreak(false);
         advanceToNextSchematic();
     }
 
@@ -1904,6 +2016,8 @@ public class FluxPrint extends Module
     {
         if (MinecraftClient.getInstance().player == null) return;
 
+        checkPathStuck();
+
         switch (state)
         {
             case IDLE                -> convertSchematics();
@@ -1939,6 +2053,9 @@ public class FluxPrint extends Module
     {
         resetAllFlags();
 
+        prevAllowBreak = BaritoneUtils.getAllowBreak();
+        BaritoneUtils.setAllowBreak(false);
+
         conversionFuture = null;
         state = BotState.IDLE;
         LogUtils.log("FluxPrint activated.");
@@ -1949,6 +2066,7 @@ public class FluxPrint extends Module
     {
         BaritoneUtils.forceCancel();
         LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+        BaritoneUtils.setAllowBreak(prevAllowBreak);
         removeCurrentPlacement();
         resetAllFlags();
         currentSchematic = null;
@@ -1985,13 +2103,14 @@ public class FluxPrint extends Module
         clearAreaStarted          = false;
         walkingToDropPos          = false;
         walkingToError            = false;
-        tookFirstSlot             = false;
         currentGrabItem           = null;
         currentChestIndex         = 0;
         currentClusterTarget      = null;
         currentErrorTarget        = null;
         nudgeDirIdx               = 0;
+        pathStuckPos              = null;
         unbreakableErrors.clear();
+        exhaustedChests.clear();
     }
 
     /***
@@ -2128,6 +2247,8 @@ public class FluxPrint extends Module
 
                         if (schemState.isAir()) continue;
 
+                        boolean hasBlockAbove = (y + 1 < size.getY()) && !container.get(x, y + 1, z).isAir();
+
                         BlockPos worldPos = new BlockPos(
                             currentPlacement.getOrigin().getX() + regionOrigin.getX() + x,
                             currentPlacement.getOrigin().getY() + regionOrigin.getY() + y,
@@ -2138,6 +2259,9 @@ public class FluxPrint extends Module
                         if (!worldState.equals(schemState))
                         {
                             if (unbreakableErrors.contains(worldPos)) continue;
+                            if (!worldState.isAir() && neverBreakBlocks.get().contains(worldState.getBlock())) continue;
+                            if (!worldState.isAir() && isContainer(worldPos)) continue;
+                            if (ignoreSupportLayer.get() && hasBlockAbove && !worldState.isAir()) continue;
 
                             unplacedBlocks.add(worldPos);
 
@@ -2444,6 +2568,7 @@ public class FluxPrint extends Module
         {
             LogUtils.log("All chests exhausted for " + currentGrabItem
                 + " — have " + have + "/" + needed + " — skipping to next item.");
+            exhaustedChests.add(currentGrabItem);
             currentGrabItem   = null;
             currentChestIndex = 0;
             walkingToStation  = false;
@@ -2459,16 +2584,15 @@ public class FluxPrint extends Module
             BaritoneUtils.goToNear(chestPos, 2);
             walkingToStation = true;
             baritoneArrived  = false;
-            tookFirstSlot    = false;
             baritoneStartTimer.reset();
             return;
         }
 
-        if (!baritoneStartTimer.hasPassed(250)) return;
-        if (BaritoneUtils.isPathing()) return;
-
         if (!baritoneArrived)
         {
+            if (!baritoneStartTimer.hasPassed(250)) return;
+            if (BaritoneUtils.isPathing()) return;
+
             double distToChest = mc.player.getPos().distanceTo(Vec3d.ofCenter(chestPos));
 
             if (distToChest > 4.0)
@@ -2482,6 +2606,7 @@ public class FluxPrint extends Module
 
             LogUtils.log("Arrived at chest for: " + currentGrabItem
                 + " (distance: " + String.format("%.1f", distToChest) + ")");
+            BaritoneUtils.forceCancel();
             baritoneArrivalTimer.reset();
             baritoneArrived = true;
             return;
@@ -2500,48 +2625,13 @@ public class FluxPrint extends Module
 
         int chestSize = chestScreen.getRows() * 9;
 
-        if (!tookFirstSlot)
-        {
-            tookFirstSlot = true;
-            ItemStack slot0 = chestScreen.getSlot(0).getStack();
-
-            if (!slot0.isEmpty() && slot0.getItem() == currentGrabItem)
-            {
-                if (getFreeInventorySlots() <= 1)
-                {
-                    LogUtils.log("Inventory full mid-grab (keeping 1 slot for food) — closing chest.");
-                    mc.player.closeHandledScreen();
-                    currentGrabItem   = null;
-                    currentChestIndex = 0;
-                    walkingToStation  = false;
-                    baritoneArrived   = false;
-                    state = BotState.PLACING;
-                    return;
-                }
-
-                LogUtils.log("Taking slot 0 — have " + countItemInInventory(currentGrabItem) + " / need " + needed);
-                mc.interactionManager.clickSlot(chestScreen.syncId, 0, 0, SlotActionType.QUICK_MOVE, mc.player);
-                itemGrabTimer.reset();
-
-                if (countItemInInventory(currentGrabItem) >= needed)
-                {
-                    LogUtils.log("Reached needed amount — closing chest.");
-                    mc.player.closeHandledScreen();
-                    currentGrabItem   = null;
-                    currentChestIndex = 0;
-                    walkingToStation  = false;
-                    baritoneArrived   = false;
-                }
-                return;
-            }
-        }
-
-        for (int slot = 1; slot < chestSize; slot++)
+        for (int slot = 0; slot < chestSize; slot++)
         {
             ItemStack stack = chestScreen.getSlot(slot).getStack();
 
             if (stack.isEmpty()) continue;
             if (stack.getItem() != currentGrabItem) continue;
+            if (stack.getCount() <= MIN_GRAB_COUNT) continue;
 
             if (countItemInInventory(currentGrabItem) >= needed)
             {
@@ -2562,16 +2652,20 @@ public class FluxPrint extends Module
                 currentChestIndex = 0;
                 walkingToStation  = false;
                 baritoneArrived   = false;
+                exhaustedChests.clear();
                 state = BotState.PLACING;
                 return;
             }
 
+            LogUtils.log("Grabbing slot " + slot + " (" + stack.getCount() + ") — have "
+                + countItemInInventory(currentGrabItem) + " / need " + needed);
             mc.interactionManager.clickSlot(chestScreen.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
             itemGrabTimer.reset();
             return;
         }
 
-        LogUtils.log("Chest at " + chestPos + " empty for " + currentGrabItem + " — moving to next chest.");
+        LogUtils.log("Chest at " + chestPos + " has no full stacks of " + currentGrabItem
+            + " — moving to next chest.");
         mc.player.closeHandledScreen();
         currentChestIndex++;
         walkingToStation = false;
@@ -2777,6 +2871,7 @@ public class FluxPrint extends Module
         Map<Item, Integer> remaining = computeRemainingNeededMaterials();
 
         return remaining.entrySet().stream()
+            .filter(e -> !exhaustedChests.contains(e.getKey()))
             .filter(e -> countItemInInventory(e.getKey()) < e.getValue())
             .min(Map.Entry.comparingByValue())
             .orElse(null);
