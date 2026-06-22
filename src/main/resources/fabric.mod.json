@@ -31,11 +31,14 @@
   "depends": {
     "fabricloader": ">=0.15.11",
     "fabric": "*",
-    "minecraft": "1.21.4",
+    "minecraft": "1.21.11",
     "malilib": "*",
     "litematica": "*",
-    "litematica_printer": "*",
     "java": ">=21"
+  },
+  "suggests": {
+    "lambda": "*",
+    "fabric-language-kotlin": "*"
   }
 }
 

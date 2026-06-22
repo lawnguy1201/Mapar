@@ -9,10 +9,6 @@ base {
 }
 
 repositories {
-    flatDir {
-        dirs("libs")
-    }
-
     maven {
         name = "meteor-maven"
         url = uri("https://maven.meteordev.org/releases")
@@ -27,6 +23,16 @@ repositories {
         name = "meteor-maven-snapshots"
         url = uri("https://maven.meteordev.org/snapshots")
     }
+
+    maven {
+        name = "modrinth"
+        url = uri("https://api.modrinth.com/maven")
+    }
+
+    maven {
+        name = "lambda"
+        url = uri("https://maven.lambda-client.org/releases")
+    }
 }
 
 dependencies {
@@ -36,12 +42,13 @@ dependencies {
     modImplementation(libs.fabric.loader)
     modImplementation(libs.fabric.api)
 
-    // Litematica + MaLiLib
-    modImplementation(files("libs/litematica-fabric-1.21.4-0.21.4-sakura.4.jar"))
-    modImplementation(files("libs/malilib-fabric-1.21.4-0.23.3-sakura.6.jar"))
+    // Litematica + MaLiLib (Modrinth maven). The Lambda printer reads Litematica's loaded schematic.
+    modImplementation("maven.modrinth:malilib:0.27.12")
+    modImplementation("maven.modrinth:litematica:0.26.8")
 
-    // Printer
-    modImplementation(files("libs/litematica-printer-1_21.4-3.3.16.jar"))
+    // Lambda client — compile-only so it isn't bundled; the user installs Lambda as a normal mod.
+    // Non-transitive: we only need its Printer class to compile against, not its baritone/jitpack deps.
+    modCompileOnly("com.lambda:lambda:0.1.0+1.21.11") { isTransitive = false }
 
     modImplementation("dev.babbaj:nether-pathfinder:1.6")
     include("dev.babbaj:nether-pathfinder:1.6")
@@ -50,8 +57,8 @@ dependencies {
     modImplementation(libs.meteor.client)
     include(libs.meteor.client)
 
-    modImplementation("meteordevelopment:baritone:1.21.4-SNAPSHOT")
-    include("meteordevelopment:baritone:1.21.4-SNAPSHOT")
+    modImplementation("meteordevelopment:baritone:1.21.11-SNAPSHOT")
+    include("meteordevelopment:baritone:1.21.11-SNAPSHOT")
 }
 
 java {

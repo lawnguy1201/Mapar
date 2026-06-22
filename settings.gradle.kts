@@ -16,6 +16,8 @@ dependencyResolutionManagement {
         maven("https://maven.meteordev.org/releases")
         maven("https://maven.meteordev.org/snapshots")
         maven("https://babbaj.github.io/maven/")
+        maven("https://api.modrinth.com/maven")
+        maven("https://maven.lambda-client.org/releases")
     }
 }
 

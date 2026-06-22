@@ -22,7 +22,6 @@ import fi.dy.masa.litematica.schematic.container.LitematicaBitArray;
 import fi.dy.masa.litematica.schematic.container.LitematicaBlockStateContainer;
 import fi.dy.masa.litematica.schematic.placement.SchematicPlacement;
 import fi.dy.masa.litematica.schematic.placement.SchematicPlacementManager;
-import me.aleksilassila.litematica.printer.v1_21_4.LitematicaMixinMod;
 
 // baritone
 import baritone.api.BaritoneAPI;
@@ -55,6 +54,7 @@ import net.minecraft.util.math.Vec3i;
 import utils.BaritoneUtils;
 import utils.LogUtils;
 import utils.MathUtils;
+import utils.PrinterUtils;
 import utils.Timer;
 
 // java
@@ -117,7 +117,7 @@ public class FluxPrint extends Module
 
     private final Setting<Boolean> ignoreSupportLayer = sgGeneral.add(new BoolSetting.Builder()
         .name("ignore support layer")
-        .description("Treat any schematic block that has another block on top of it as support and accept whatever is already in the world there. This lets the map finish even though your platform base never matches the schematic's base. Only the top block of each column (the carpets) is placed and verified. Missing support (air) is still built.")
+        .description("Treat any schematic block that has another block on top of it as support/scaffolding and ignore it completely — never placed, broken, or checked, regardless of what is (or isn't) in the world there. Only the top block of each column (the carpets) is placed and verified, sitting on whatever already exists in the world. Turn this off only if you want the bot to build the full support structure itself.")
         .defaultValue(true)
         .build()
     );
@@ -340,7 +340,8 @@ public class FluxPrint extends Module
 
     private final Map<Block, List<BlockPos>> chestMap     = new HashMap<>();
     private final Map<Item, Integer>         matNeeded    = new HashMap<>();
-    private final Set<Item>                  exhaustedChests = new HashSet<>();
+    private final Set<Item>                  exhaustedChests   = new HashSet<>();
+    private final Set<Item>                  unobtainableItems = new HashSet<>();
     private List<BlockPos>                   unplacedCache = new ArrayList<>();
 
     private Map<Item, Integer>               remainingMatsCache = new HashMap<>();
@@ -525,22 +526,21 @@ public class FluxPrint extends Module
             NbtSizeTracker.ofUnlimitedBytes()
         );
 
-        NbtList sizeList = structureNbt.getList("size", NbtElement.INT_TYPE);
-        int sizeX = sizeList.getInt(0);
-        int sizeY = sizeList.getInt(1);
-        int sizeZ = sizeList.getInt(2);
+        NbtList sizeList = structureNbt.getListOrEmpty("size");
+        int sizeX = sizeList.getInt(0, 0);
+        int sizeY = sizeList.getInt(1, 0);
+        int sizeZ = sizeList.getInt(2, 0);
 
-        int dataVersion = structureNbt.getInt("DataVersion");
+        int dataVersion = structureNbt.getInt("DataVersion", 0);
 
-        NbtList      paletteList   = structureNbt.getList("palette", NbtElement.COMPOUND_TYPE);
+        NbtList      paletteList   = structureNbt.getListOrEmpty("palette");
         BlockState[] structPalette = new BlockState[paletteList.size()];
 
         for (int i = 0; i < paletteList.size(); i++)
         {
-            NbtCompound entry    = paletteList.getCompound(i);
-            String      blockId  = entry.getString("Name");
-            NbtCompound propsNbt = entry.contains("Properties")
-                ? entry.getCompound("Properties") : null;
+            NbtCompound entry    = paletteList.getCompoundOrEmpty(i);
+            String      blockId  = entry.getString("Name", "");
+            NbtCompound propsNbt = entry.getCompound("Properties").orElse(null);
 
             Block      block = Registries.BLOCK.get(Identifier.of(blockId));
             BlockState bs    = block.getDefaultState();
@@ -553,7 +553,7 @@ public class FluxPrint extends Module
                     Property<?> prop = sm.getProperty(propName);
                     if (prop != null)
                     {
-                        bs = applyProperty(bs, prop, propsNbt.getString(propName));
+                        bs = applyProperty(bs, prop, propsNbt.getString(propName, ""));
                     }
                 }
             }
@@ -566,16 +566,16 @@ public class FluxPrint extends Module
         Map<BlockState, Integer> stateToIndex = new LinkedHashMap<>();
         stateToIndex.put(Blocks.AIR.getDefaultState(), 0);
 
-        NbtList blocksList = structureNbt.getList("blocks", NbtElement.COMPOUND_TYPE);
+        NbtList blocksList = structureNbt.getListOrEmpty("blocks");
         for (int i = 0; i < blocksList.size(); i++)
         {
-            NbtCompound blockEntry = blocksList.getCompound(i);
-            NbtList     pos        = blockEntry.getList("pos", NbtElement.INT_TYPE);
-            int         stateIdx   = blockEntry.getInt("state");
+            NbtCompound blockEntry = blocksList.getCompoundOrEmpty(i);
+            NbtList     pos        = blockEntry.getListOrEmpty("pos");
+            int         stateIdx   = blockEntry.getInt("state", 0);
 
-            int x = pos.getInt(0);
-            int y = pos.getInt(1);
-            int z = pos.getInt(2);
+            int x = pos.getInt(0, 0);
+            int y = pos.getInt(1, 0);
+            int z = pos.getInt(2, 0);
 
             BlockState bs = structPalette[stateIdx];
 
@@ -722,7 +722,7 @@ public class FluxPrint extends Module
         LogUtils.log("File exists: " + schFile.exists() + " | Size: " + schFile.length() + " bytes");
 
         String nameNoExt = schFile.getName().replace(".litematic", "");
-        currentSchematic = LitematicaSchematic.createFromFile(schematicsFolder, nameNoExt);
+        currentSchematic = LitematicaSchematic.createFromFile(schematicsFolder.toPath(), nameNoExt);
 
         if (currentSchematic == null)
         {
@@ -852,7 +852,17 @@ public class FluxPrint extends Module
 
         if (getNextNeededEntry(freeSlots) == null)
         {
-            LogUtils.log("All materials collected — moving to placing.");
+            if (!exhaustedChests.isEmpty())
+            {
+                LogUtils.log("Could not obtain " + exhaustedChests
+                    + " from any chest — giving up on those positions so the map can finish.");
+                unobtainableItems.addAll(exhaustedChests);
+                unplacedCacheTimer.ms = 0;
+            }
+            else
+            {
+                LogUtils.log("All materials collected — moving to placing.");
+            }
             walkingToStation  = false;
             currentGrabItem   = null;
             currentChestIndex = 0;
@@ -914,7 +924,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(dropPos));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(dropPos));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to drop position (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1057,7 +1067,7 @@ public class FluxPrint extends Module
     }
 
     /***
-     * doPlacing() walks to the next placeable cluster and lets litematica Printer place blocks there.
+     * doPlacing() walks to the next placeable cluster and lets the Lambda printer place blocks there.
      */
     public void doPlacing()
     {
@@ -1065,7 +1075,7 @@ public class FluxPrint extends Module
 
         if (unplaced.isEmpty())
         {
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+            setPrinter(false);
             LogUtils.log("All blocks placed — printer turned off. Moving to verification.");
             currentClusterTarget = null;
             BaritoneUtils.forceCancel();
@@ -1075,7 +1085,7 @@ public class FluxPrint extends Module
 
         if (fixErrors.get() && !getWrongBlocks(unplaced).isEmpty())
         {
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+            setPrinter(false);
             LogUtils.log("Wrong block(s) detected — switching to error clearing.");
             currentClusterTarget = null;
             BaritoneUtils.forceCancel();
@@ -1085,7 +1095,7 @@ public class FluxPrint extends Module
 
         if (needsRestock())
         {
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+            setPrinter(false);
             LogUtils.log("Out of materials — printer off, heading to restock.");
             currentClusterTarget = null;
             BaritoneUtils.forceCancel();
@@ -1099,10 +1109,17 @@ public class FluxPrint extends Module
 
             if (currentClusterTarget == null)
             {
-                LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
-                LogUtils.log("No placeable clusters found — heading to restock.");
+                setPrinter(false);
                 BaritoneUtils.forceCancel();
                 clusterNearestToPlayer = false;
+
+                if (!fixErrors.get() && !getWrongBlocks(unplaced).isEmpty())
+                {
+                    pause("Wrong Blocks Found - Enable Fix Placement Errors");
+                    return;
+                }
+
+                LogUtils.log("No placeable clusters found — heading to restock.");
                 state = nextStateAfterDropOrRestock();
                 return;
             }
@@ -1110,7 +1127,7 @@ public class FluxPrint extends Module
             LogUtils.log("walking to cluster at " + currentClusterTarget
                 + " (" + unplaced.size() + " blocks remaining)");
 
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(true);
+            setPrinter(true);
             BaritoneUtils.goTo(currentClusterTarget);
             baritoneStartTimer.reset();
             clusterArrivalTimer.reset();
@@ -1121,11 +1138,11 @@ public class FluxPrint extends Module
         if (!baritoneStartTimer.hasPassed(250)) return;
         if (BaritoneUtils.isPathing())
         {
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(true);
+            setPrinter(true);
             return;
         }
 
-        LitematicaMixinMod.PRINT_MODE.setBooleanValue(true);
+        setPrinter(true);
 
         if (!clusterArrivalTimer.hasPassedDouble(clusterCheckInterval.get() * 1000)) return;
 
@@ -1133,11 +1150,18 @@ public class FluxPrint extends Module
 
         if (newTarget == null)
         {
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
-            LogUtils.log("No placeable clusters remaining — heading to restock.");
+            setPrinter(false);
             BaritoneUtils.forceCancel();
             currentClusterTarget   = null;
             clusterNearestToPlayer = false;
+
+            if (!fixErrors.get() && !getWrongBlocks(unplaced).isEmpty())
+            {
+                pause("Wrong Blocks Found - Enable Fix Placement Errors");
+                return;
+            }
+
+            LogUtils.log("No placeable clusters remaining — heading to restock.");
             state = nextStateAfterDropOrRestock();
             return;
         }
@@ -1155,7 +1179,7 @@ public class FluxPrint extends Module
             LogUtils.log("Migrating to next cluster " + newTarget
                 + " (" + unplaced.size() + " blocks remaining)");
             currentClusterTarget = newTarget;
-            LitematicaMixinMod.PRINT_MODE.setBooleanValue(true);
+            setPrinter(true);
             BaritoneUtils.goTo(newTarget);
             baritoneStartTimer.reset();
             clusterStuckTimer.reset();
@@ -1190,7 +1214,7 @@ public class FluxPrint extends Module
             + String.format("%.1f", clusterStuckTimeout.get())
             + "s — nudging to " + nudgeTarget + " to free under-foot block.");
 
-        LitematicaMixinMod.PRINT_MODE.setBooleanValue(true);
+        setPrinter(true);
         BaritoneUtils.goTo(nudgeTarget);
         baritoneStartTimer.reset();
         clusterArrivalTimer.reset();
@@ -1216,7 +1240,7 @@ public class FluxPrint extends Module
             return;
         }
 
-        Vec3d pos = mc.player.getPos();
+        Vec3d pos = mc.player.getEntityPos();
 
         if (pathStuckPos == null || pos.distanceTo(pathStuckPos) > 0.5)
         {
@@ -1233,7 +1257,7 @@ public class FluxPrint extends Module
             double angle = Math.random() * Math.PI * 2;
             double vy    = mc.player.isOnGround() ? 0.42 : mc.player.getVelocity().y;
             mc.player.setVelocity(Math.cos(angle) * 0.4, vy, Math.sin(angle) * 0.4);
-            mc.player.velocityModified = true;
+            mc.player.velocityDirty = true;
 
             baritoneStartTimer.reset();
             pathStuckPos = null;
@@ -1275,7 +1299,7 @@ public class FluxPrint extends Module
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc == null || mc.player == null || mc.world == null || mc.interactionManager == null) return;
 
-        LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+        setPrinter(false);
 
         List<BlockPos> wrong = getWrongBlocks(getUnplacedBlocks());
 
@@ -1292,7 +1316,7 @@ public class FluxPrint extends Module
 
         if (currentErrorTarget == null || !wrong.contains(currentErrorTarget))
         {
-            currentErrorTarget = nearestPos(wrong, mc.player.getPos());
+            currentErrorTarget = nearestPos(wrong, mc.player.getEntityPos());
             walkingToError     = false;
             baritoneArrived    = false;
         }
@@ -1320,7 +1344,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(currentErrorTarget));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(currentErrorTarget));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to wrong block ("
@@ -1498,7 +1522,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(mapChest));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(mapChest));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to map chest (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1548,7 +1572,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(schemCenter));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(schemCenter));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to platform center (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1626,7 +1650,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(outputChest));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(outputChest));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to output chest (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1729,7 +1753,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(cartTable));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(cartTable));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to cartography table (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1854,7 +1878,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double dist = mc.player.getPos().distanceTo(Vec3d.ofCenter(restButton));
+            double dist = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(restButton));
             if (dist > 4.0)
             {
                 LogUtils.log("Not close enough to reset button (" + String.format("%.1f", dist) + ") — re-pathing.");
@@ -1991,6 +2015,7 @@ public class FluxPrint extends Module
         currentPlacement = null;
         unplacedCache    = new ArrayList<>();
         unbreakableErrors.clear();
+        unobtainableItems.clear();
 
         LogUtils.log("Moving to Schematic #" + nextIndex + ": " + schemFiles[nextIndex].getName());
         state = BotState.ANALYZING;
@@ -2065,7 +2090,7 @@ public class FluxPrint extends Module
     public void onDeactivate()
     {
         BaritoneUtils.forceCancel();
-        LitematicaMixinMod.PRINT_MODE.setBooleanValue(false);
+        setPrinter(false);
         BaritoneUtils.setAllowBreak(prevAllowBreak);
         removeCurrentPlacement();
         resetAllFlags();
@@ -2078,6 +2103,19 @@ public class FluxPrint extends Module
     {
         LogUtils.error("Bot Paused - Reason: " + reason);
         state = BotState.PAUSED;
+    }
+
+    /***
+     * setPrinter() enables or disables Lambda client's Printer module. Pauses the bot if Lambda
+     * isn't installed.
+     */
+    private void setPrinter(boolean enabled)
+    {
+        if (!PrinterUtils.setPrinter(enabled) && enabled)
+        {
+            LogUtils.error("Lambda Printer not found — install the Lambda client mod.");
+            pause("Lambda Printer Missing");
+        }
     }
 
     /***
@@ -2111,6 +2149,7 @@ public class FluxPrint extends Module
         pathStuckPos              = null;
         unbreakableErrors.clear();
         exhaustedChests.clear();
+        unobtainableItems.clear();
     }
 
     /***
@@ -2261,11 +2300,13 @@ public class FluxPrint extends Module
                             if (unbreakableErrors.contains(worldPos)) continue;
                             if (!worldState.isAir() && neverBreakBlocks.get().contains(worldState.getBlock())) continue;
                             if (!worldState.isAir() && isContainer(worldPos)) continue;
-                            if (ignoreSupportLayer.get() && hasBlockAbove && !worldState.isAir()) continue;
+                            if (ignoreSupportLayer.get() && hasBlockAbove) continue;
+
+                            Item item = schemState.getBlock().asItem();
+                            if (item != null && unobtainableItems.contains(item)) continue;
 
                             unplacedBlocks.add(worldPos);
 
-                            Item item = schemState.getBlock().asItem();
                             if (item != null && item != Items.AIR)
                             {
                                 remainingMats.merge(item, 1, Integer::sum);
@@ -2295,9 +2336,9 @@ public class FluxPrint extends Module
         if (unplaced.isEmpty()) return null;
 
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.player == null || mc.interactionManager == null) return null;
+        if (mc.player == null || mc.interactionManager == null || mc.world == null) return null;
 
-        Vec3d playerPos = mc.player.getPos();
+        Vec3d playerPos = mc.player.getEntityPos();
 
         Set<Block> blocksInInventory = new HashSet<>();
         for (Map.Entry<Item, Integer> entry : matNeeded.entrySet())
@@ -2311,6 +2352,8 @@ public class FluxPrint extends Module
         List<BlockPos> placeable = new ArrayList<>();
         for (BlockPos pos : unplaced)
         {
+            if (!mc.world.getBlockState(pos).isReplaceable()) continue;
+
             BlockState schemState = getSchemStateAt(pos);
             if (schemState != null && blocksInInventory.contains(schemState.getBlock()))
             {
@@ -2593,7 +2636,7 @@ public class FluxPrint extends Module
             if (!baritoneStartTimer.hasPassed(250)) return;
             if (BaritoneUtils.isPathing()) return;
 
-            double distToChest = mc.player.getPos().distanceTo(Vec3d.ofCenter(chestPos));
+            double distToChest = mc.player.getEntityPos().distanceTo(Vec3d.ofCenter(chestPos));
 
             if (distToChest > 4.0)
             {
@@ -2729,7 +2772,7 @@ public class FluxPrint extends Module
 
         LogUtils.error("No empty maps found in chest at " + chestPos);
         mc.player.closeHandledScreen();
-        mapGrabed = false;
+        pause("No Empty Maps In Map Chest");
     }
 
     /***
@@ -2787,7 +2830,7 @@ public class FluxPrint extends Module
 
         LogUtils.error("No glass panes found in chest at " + chestPos);
         mc.player.closeHandledScreen();
-        glassPaneGrabbed = false;
+        pause("No Glass Panes In Map Chest");
     }
 
     /***
